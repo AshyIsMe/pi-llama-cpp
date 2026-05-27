@@ -4,6 +4,8 @@ Pi provider extension for local Qwen 3.6 / Qwen 3.6 MTP and Qwen 3.5 GGUF models
 [llama.cpp](https://github.com/ggml-org/llama.cpp) binary releases and Unsloth
 quantized models.
 
+Inspired by https://github.com/mitsuhiko/pi-ds4.
+
 It registers these `/model` entries:
 
 - `llama-cpp/qwen3.6-27b`
