@@ -1,0 +1,21 @@
+{
+  "name": "pi-llama-cpp",
+  "version": "0.1.0",
+  "description": "Pi provider extension for local Qwen 3.6 / Qwen 3.6 MTP / Qwen 3.5 GGUF models via llama.cpp.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi-extension", "llama.cpp", "qwen", "gguf", "unsloth"],
+  "pi": { "extensions": ["./index.ts"] },
+  "files": [
+    "index.ts",
+    "llama-cpp-watchdog.sh",
+    "install-pi-extension-local.sh",
+    "settings.example.json",
+    "settings.schema.json",
+    "pi-llama-cpp-config/SKILL.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
+  "peerDependenciesMeta": { "@earendil-works/pi-coding-agent": { "optional": true } }
+}

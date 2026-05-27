@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/your-name/pi-llama-cpp/main/settings.schema.json",
+  "title": "pi-llama-cpp settings",
+  "type": "object",
+  "additionalProperties": false,
+  "patternProperties": {
+    "^(qwen(35|36)_[A-Za-z0-9_]+(Repo|File|Quant|Ctx|MaxTokens)|LLAMA_CPP_QWEN(35|36)_[A-Z0-9_]+_(REPO|FILE|QUANT|CTX|MAX_TOKENS))$": { "type": ["string", "number", "null"] }
+  },
+  "properties": {
+    "$schema": { "type": "string" },
+    "protocol": { "$ref": "#/$defs/protocol" },
+    "backend": { "$ref": "#/$defs/backend" },
+    "apiKey": { "$ref": "#/$defs/nullableString" },
+    "releaseUrl": { "$ref": "#/$defs/nullableString" },
+    "serverBinary": { "$ref": "#/$defs/nullableString" },
+    "serverArgs": { "$ref": "#/$defs/nullableString" },
+    "nGpuLayers": { "$ref": "#/$defs/nullableString" },
+    "modelQuant": { "$ref": "#/$defs/nullableString" },
+    "ctx": { "$ref": "#/$defs/nullableNumber" },
+    "maxTokens": { "$ref": "#/$defs/nullableNumber" },
+    "readyTimeoutMs": { "$ref": "#/$defs/nullableNumber" },
+    "qwen36Repo": { "$ref": "#/$defs/nullableString" },
+    "qwen36File": { "$ref": "#/$defs/nullableString" },
+    "qwen36Quant": { "$ref": "#/$defs/nullableString" },
+    "qwen36Ctx": { "$ref": "#/$defs/nullableNumber" },
+    "qwen36MaxTokens": { "$ref": "#/$defs/nullableNumber" },
+    "qwen35Repo": { "$ref": "#/$defs/nullableString" },
+    "qwen35File": { "$ref": "#/$defs/nullableString" },
+    "qwen35Quant": { "$ref": "#/$defs/nullableString" },
+    "qwen35Ctx": { "$ref": "#/$defs/nullableNumber" },
+    "qwen35MaxTokens": { "$ref": "#/$defs/nullableNumber" },
+
+    "LLAMA_CPP_PROTOCOL": { "$ref": "#/$defs/protocol" },
+    "LLAMA_CPP_BACKEND": { "$ref": "#/$defs/backend" },
+    "LLAMA_CPP_API_KEY": { "$ref": "#/$defs/nullableString" },
+    "LLAMA_CPP_RELEASE_URL": { "$ref": "#/$defs/nullableString" },
+    "LLAMA_CPP_SERVER_BINARY": { "$ref": "#/$defs/nullableString" },
+    "LLAMA_CPP_SERVER_ARGS": { "$ref": "#/$defs/nullableString" },
+    "LLAMA_CPP_N_GPU_LAYERS": { "$ref": "#/$defs/nullableString" },
+    "LLAMA_CPP_MODEL_QUANT": { "$ref": "#/$defs/nullableString" },
+    "LLAMA_CPP_CTX": { "$ref": "#/$defs/nullableNumber" },
+    "LLAMA_CPP_MAX_TOKENS": { "$ref": "#/$defs/nullableNumber" },
+    "LLAMA_CPP_READY_TIMEOUT_MS": { "$ref": "#/$defs/nullableNumber" },
+    "LLAMA_CPP_QWEN36_REPO": { "$ref": "#/$defs/nullableString" },
+    "LLAMA_CPP_QWEN36_FILE": { "$ref": "#/$defs/nullableString" },
+    "LLAMA_CPP_QWEN35_REPO": { "$ref": "#/$defs/nullableString" },
+    "LLAMA_CPP_QWEN35_FILE": { "$ref": "#/$defs/nullableString" }
+  },
+  "$defs": {
+    "nullableString": { "type": ["string", "null"] },
+    "nullableNumber": { "type": ["number", "string", "null"] },
+    "backend": { "type": ["string", "null"], "enum": ["cpu", "vulkan", "cuda", "rocm", "metal", null] },
+    "protocol": { "type": ["string", "null"], "enum": ["openai", "openai-completions", "chat", "chat-completions", "responses", "openai-responses", null] }
+  }
+}
