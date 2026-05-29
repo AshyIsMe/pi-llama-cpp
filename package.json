@@ -17,5 +17,10 @@
     "LICENSE"
   ],
   "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
-  "peerDependenciesMeta": { "@earendil-works/pi-coding-agent": { "optional": true } }
+  "peerDependenciesMeta": { "@earendil-works/pi-coding-agent": { "optional": true } },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.77.0",
+    "@types/node": "^25.9.1",
+    "typescript": "^6.0.3"
+  }
 }

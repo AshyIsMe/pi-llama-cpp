@@ -52,6 +52,7 @@ type ModelKey = (typeof MODEL_CATALOG)[number]["id"];
 type Settings = Record<string, unknown>;
 type StatusCallback = (message: string | undefined) => void;
 type RunOptions = { onStatus?: StatusCallback; progressPrefix?: string };
+type LocalBuildPolicy = "auto" | "always" | "never";
 
 type ServerState = {
 	managedBy: string;
@@ -106,6 +107,16 @@ function configNumber(envName: string, def: number): number {
 	if (!Number.isFinite(n)) throw new Error(`${envName} must be a finite number`);
 	return n;
 }
+function configArgs(envName: string, def?: string | string[]): string[] {
+	const value = settingValue(envName);
+	if (value === undefined || value === null || value === "") return Array.isArray(def) ? def : splitConfigArgs(def);
+	if (Array.isArray(value)) return value.map((v) => {
+		if (!["string", "number", "boolean"].includes(typeof v)) throw new Error(`${envName} entries must be strings`);
+		return String(v);
+	});
+	if (["string", "number", "boolean"].includes(typeof value)) return splitConfigArgs(String(value));
+	throw new Error(`${envName} must be a string or string array in the environment or ${SETTINGS_FILE}`);
+}
 function selectedProtocol(): ProviderProtocol {
 	const raw = configString("LLAMA_CPP_PROTOCOL", "openai")!.toLowerCase();
 	if (["openai", "chat", "chat-completions", "openai-completions"].includes(raw)) return "openai-completions";
@@ -130,6 +141,24 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 function describeError(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function isPidAlive(pid: unknown): pid is number { if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; } }
 function shellQuote(value: string): string { return /^[A-Za-z0-9_./:=+@%-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`; }
+function expandPath(value: string): string { return value === "~" ? homedir() : value.startsWith("~/") ? join(homedir(), value.slice(2)) : value; }
+function resolveConfigPath(value: string, baseDir?: string): string { const expanded = expandPath(value); return resolve(baseDir && !expanded.startsWith("/") ? baseDir : process.cwd(), expanded); }
+function splitConfigArgs(raw?: string): string[] {
+	if (!raw) return [];
+	const args: string[] = []; let current = "", quote: "'" | '"' | undefined, escaped = false;
+	for (const ch of raw) {
+		if (escaped) { current += ch; escaped = false; continue; }
+		if (ch === "\\" && quote !== "'") { escaped = true; continue; }
+		if (quote) { if (ch === quote) quote = undefined; else current += ch; continue; }
+		if (ch === "'" || ch === '"') { quote = ch; continue; }
+		if (/\s/.test(ch)) { if (current) { args.push(current); current = ""; } continue; }
+		current += ch;
+	}
+	if (escaped) current += "\\";
+	if (quote) throw new Error(`Unterminated quote in argument setting: ${raw}`);
+	if (current) args.push(current);
+	return args;
+}
 function formatBytes(bytes: number): string { if (bytes < 1024) return `${bytes} B`; if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`; if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`; return `${(bytes / 1024 ** 3).toFixed(1)} GB`; }
 async function appendLog(text: string): Promise<void> { await mkdir(ROOT_DIR, { recursive: true }); await appendFile(LOG_FILE, text, "utf8"); }
 async function readJson<T>(file: string): Promise<T | undefined> { try { return JSON.parse(await readFile(file, "utf8")) as T; } catch { return undefined; } }
@@ -239,8 +268,47 @@ async function latestReleaseAsset(backend: Backend): Promise<{ name: string; url
 	if (!best) throw new Error(`No llama.cpp binary release asset found for backend ${backend}; set LLAMA_CPP_RELEASE_URL`);
 	return { name: best.name, url: best.browser_download_url };
 }
+function localBuildPolicy(): LocalBuildPolicy {
+	const value = (configString("LLAMA_CPP_BUILD_POLICY", "auto") ?? "auto").toLowerCase();
+	if (["auto", "always", "never"].includes(value)) return value as LocalBuildPolicy;
+	throw new Error(`LLAMA_CPP_BUILD_POLICY must be auto, always, or never`);
+}
+function backendCmakeArgs(backend: Backend): string[] {
+	if (backend === "cuda") return ["-DGGML_CUDA=ON"];
+	if (backend === "rocm") return ["-DGGML_HIP=ON"];
+	if (backend === "vulkan") return ["-DGGML_VULKAN=ON"];
+	if (backend === "metal") return ["-DGGML_METAL=ON"];
+	return [];
+}
+async function executableFile(dir: string, name: string): Promise<string | undefined> {
+	const found = await findFile(dir, name);
+	if (!found) return undefined;
+	await chmod(found, 0o755).catch(() => {});
+	try { await access(found, constants.X_OK); return found; } catch { return undefined; }
+}
+async function ensureLocalRuntime(backend: Backend, onStatus?: StatusCallback): Promise<string | undefined> {
+	const sourceSetting = configString("LLAMA_CPP_SOURCE_DIR");
+	const buildSetting = configString("LLAMA_CPP_BUILD_DIR");
+	if (!sourceSetting && !buildSetting) return undefined;
+	const sourceDir = sourceSetting ? resolveConfigPath(sourceSetting) : undefined;
+	const buildDir = buildSetting ? resolveConfigPath(buildSetting, sourceDir) : join(sourceDir!, "build");
+	const binaryName = process.platform === "win32" ? "llama-server.exe" : "llama-server";
+	const policy = localBuildPolicy();
+	const existing = await executableFile(buildDir, binaryName);
+	if (existing && policy !== "always") return existing;
+	if (!sourceDir) throw new Error(`${buildDir} does not contain executable ${binaryName}; set LLAMA_CPP_SOURCE_DIR to build it or LLAMA_CPP_SERVER_BINARY to point directly at it`);
+	if (policy === "never") throw new Error(`${buildDir} does not contain executable ${binaryName} and LLAMA_CPP_BUILD_POLICY=never`);
+	await access(sourceDir, constants.R_OK);
+	onStatus?.(`building local llama.cpp (${backend})`);
+	await runLogged("cmake", ["-S", sourceDir, "-B", buildDir, "-DCMAKE_BUILD_TYPE=Release", ...backendCmakeArgs(backend), ...configArgs("LLAMA_CPP_CMAKE_ARGS")], sourceDir, "configure local llama.cpp", { onStatus, progressPrefix: "configuring llama.cpp" });
+	await runLogged("cmake", ["--build", buildDir, "--target", "llama-server", "--config", "Release", "--parallel", ...configArgs("LLAMA_CPP_BUILD_ARGS")], sourceDir, "build local llama.cpp", { onStatus, progressPrefix: "building llama.cpp" });
+	const built = await executableFile(buildDir, binaryName);
+	if (!built) throw new Error(`Built ${sourceDir} but did not find executable ${binaryName} under ${buildDir}`);
+	return built;
+}
 async function ensureRuntime(backend: Backend, onStatus?: StatusCallback): Promise<string> {
-	const forced = configString("LLAMA_CPP_SERVER_BINARY"); if (forced) { await access(forced, constants.X_OK); return forced; }
+	const forced = configString("LLAMA_CPP_SERVER_BINARY"); if (forced) { const binary = resolveConfigPath(forced); await access(binary, constants.X_OK); return binary; }
+	const local = await ensureLocalRuntime(backend, onStatus); if (local) return local;
 	const dir = join(RUNTIME_DIR, backend); const binary = join(dir, process.platform === "win32" ? "llama-server.exe" : "llama-server");
 	const manifest = await readJson<{ binary?: string }>(join(dir, "pi-llama-cpp-runtime.json"));
 	if (manifest?.binary) { try { await access(manifest.binary, constants.X_OK); return manifest.binary; } catch {} }
@@ -294,13 +362,13 @@ async function checkReadyForModel(modelId: ModelKey) { if (!(await checkHttpRead
 async function waitForPidExit(pid: number, timeoutMs: number) { const end = Date.now() + timeoutMs; while (Date.now() < end) { if (!isPidAlive(pid)) return true; await sleep(500); } return !isPidAlive(pid); }
 async function stopServerPidLocked(pid: number, reason: string) { await appendLog(`\n[${new Date().toISOString()}] ${reason}; stopping llama-server pid=${pid}\n`); try { process.kill(pid, "SIGTERM"); } catch {} if (!(await waitForPidExit(pid, SHUTDOWN_GRACE_MS))) { try { process.kill(pid, "SIGKILL"); } catch {} } await clearState(); }
 function serverArgs(spec: ModelSpec, modelPath: string): string[] {
-	const extra = (configString("LLAMA_CPP_SERVER_ARGS", "--parallel 1 --timeout 600") ?? "").split(/\s+/).filter(Boolean);
+	const extra = [...configArgs("LLAMA_CPP_SERVER_ARGS", "--parallel 1 --timeout 600"), ...configArgs("LLAMA_CPP_SERVER_EXTRA_ARGS")];
 	return ["--host", "127.0.0.1", "--port", "8080", "--model", modelPath, "--ctx-size", String(spec.contextWindow), "--n-gpu-layers", configString("LLAMA_CPP_N_GPU_LAYERS", "999")!, "--jinja", "--reasoning", "off", ...extra];
 }
 async function startServerLocked(binary: string, backend: Backend, spec: ModelSpec, modelPath: string) { const args = serverArgs(spec, modelPath); await appendLog(`\n[${new Date().toISOString()}] start llama-server (${backend}, ${spec.id}, ${formatBytes(totalmem())} RAM)\n$ ${[binary, ...args].map(shellQuote).join(" ")}\n`); const logFd = openSync(LOG_FILE, "a"); let pid: number | undefined; try { const child = spawn(binary, args, { cwd: dirname(binary), detached: true, stdio: ["ignore", logFd, logFd], env: process.env }); child.unref(); pid = child.pid; } finally { closeSync(logFd); } if (!pid) throw new Error("failed to start llama-server"); const now = Date.now(); await writeJsonAtomic(STATE_FILE, { managedBy: MANAGED_BY, pid, baseUrl: API_BASE_URL, port: 8080, cwd: dirname(binary), binary, args, backend, modelId: spec.id, modelPath, startedAt: now, startedAtIso: new Date(now).toISOString() } satisfies ServerState); }
 async function waitForServerReady(modelId: ModelKey, onStatus?: StatusCallback) { const started = Date.now(); let last = 0; while (Date.now() - started < READY_TIMEOUT_MS) { if (runtimeDisposed || shuttingDown) return; if (await checkReadyForModel(modelId)) return; const state = await readState(); if (state?.pid && !isPidAlive(state.pid)) throw new Error(`llama-server exited before becoming ready; see ${LOG_FILE}`); if (Date.now() - last > 10000) { onStatus?.(`llama-server starting (${Math.round((Date.now() - started) / 1000)}s)`); last = Date.now(); } await sleep(1000); } throw new Error(`Timed out waiting for llama-server at ${API_BASE_URL}; see ${LOG_FILE}`); }
 async function ensureServerInner(modelId: ModelKey, ctx: any, onStatus?: StatusCallback) { const spec = modelSpec(modelId); let stoppingPid: number | undefined; await withLock(async () => { await activateLease(); const state = await readState(); if (state?.pid && isPidAlive(state.pid) && await looksLikeServer(state.pid)) { if (state.stopping) { stoppingPid = state.pid; return; } if (state.modelId === modelId) return; onStatus?.(`switching llama-server to ${modelId}`); await stopServerPidLocked(state.pid, `switch to ${modelId}`); } else if (state?.pid) await clearState(); const backend = await chooseBackend(ctx); const binary = await ensureRuntime(backend, onStatus); const modelPath = await ensureModel(spec, onStatus); onStatus?.(`starting llama-server (${backend}, ${modelId})`); await startServerLocked(binary, backend, spec, modelPath); }, STARTUP_LOCK_TIMEOUT_MS); if (stoppingPid) { await waitForPidExit(stoppingPid, SHUTDOWN_GRACE_MS); return ensureServerInner(modelId, ctx, onStatus); } await waitForServerReady(modelId, onStatus); }
-function ensureServer(modelId: ModelKey, ctx: any, onStatus?: StatusCallback) { if (startupPromise) { if (startupModelId === modelId) return startupPromise; return startupPromise.catch(() => {}).then(() => ensureServer(modelId, ctx, onStatus)); } startupModelId = modelId; const p = ensureServerInner(modelId, ctx, onStatus).finally(() => { if (startupPromise === p) { startupPromise = undefined; startupModelId = undefined; } }); startupPromise = p; return p; }
+function ensureServer(modelId: ModelKey, ctx: any, onStatus?: StatusCallback): Promise<void> { if (startupPromise) { if (startupModelId === modelId) return startupPromise; return startupPromise.catch(() => {}).then(() => ensureServer(modelId, ctx, onStatus)); } startupModelId = modelId; const p = ensureServerInner(modelId, ctx, onStatus).finally(() => { if (startupPromise === p) { startupPromise = undefined; startupModelId = undefined; } }); startupPromise = p; return p; }
 
 function registerProvider(pi: ExtensionAPI) {
 	pi.registerProvider(PROVIDER_ID, { name: "llama.cpp local", baseUrl: API_BASE_URL, api: PROVIDER_API, apiKey: configString("LLAMA_CPP_API_KEY", "llama-cpp-local"), compat: { supportsStore: false, supportsDeveloperRole: false, supportsReasoningEffort: false, supportsUsageInStreaming: true, maxTokensField: "max_tokens", supportsStrictMode: false }, models: allModels().map((m) => ({ id: m.id, name: m.name, reasoning: false, input: ["text"], contextWindow: m.contextWindow, maxTokens: m.maxTokens, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } })) } as any);

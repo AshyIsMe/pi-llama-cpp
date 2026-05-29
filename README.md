@@ -25,7 +25,7 @@ On first use it:
 
 1. detects available llama.cpp backends (`metal`, `cuda`, `rocm`, `vulkan`, `cpu`),
 2. asks you to choose if multiple accelerated backends are plausible,
-3. downloads the matching latest llama.cpp binary release,
+3. uses a configured local llama.cpp checkout/build, or downloads the matching latest llama.cpp binary release,
 4. downloads the configured Unsloth GGUF quant from Hugging Face,
 5. starts `llama-server` on `127.0.0.1:8080`, and
 6. keeps it alive while Pi clients have active leases.
@@ -68,8 +68,16 @@ Important options:
 
 - `LLAMA_CPP_BACKEND`: force `metal`, `cuda`, `rocm`, `vulkan`, or `cpu`.
 - `LLAMA_CPP_RELEASE_URL`: force a specific llama.cpp release zip URL.
-- `LLAMA_CPP_SERVER_BINARY`: use an existing `llama-server` binary.
-- `LLAMA_CPP_SERVER_ARGS`: extra args appended to `llama-server`, default `--parallel 1 --timeout 600`. The extension always starts llama.cpp with `--reasoning off` before extra args so local models run with thinking disabled by default.
+- `LLAMA_CPP_SERVER_BINARY`: use an existing `llama-server` binary directly.
+- `LLAMA_CPP_SOURCE_DIR`: path to a local llama.cpp checkout/fork. When set, the extension builds/uses it instead of downloading a release.
+- `LLAMA_CPP_BUILD_DIR`: local CMake build directory. Absolute paths are used as-is; relative paths are resolved under `LLAMA_CPP_SOURCE_DIR`. Defaults to `build` under `LLAMA_CPP_SOURCE_DIR`.
+- `LLAMA_CPP_BUILD_POLICY`: `auto` (default; build only when no `llama-server` is found), `always`, or `never`.
+- `LLAMA_CPP_CMAKE_ARGS`: extra args appended to `cmake -S ... -B ...`; `-DCMAKE_BUILD_TYPE=Release` and backend flags like `-DGGML_CUDA=ON` are added automatically before these args.
+- `LLAMA_CPP_BUILD_ARGS`: extra args appended to `cmake --build ... --parallel`.
+- `LLAMA_CPP_SERVER_ARGS`: args appended to `llama-server`, default `--parallel 1 --timeout 600`.
+- `LLAMA_CPP_SERVER_EXTRA_ARGS`: additional llama-server CLI args appended after `LLAMA_CPP_SERVER_ARGS`; useful for local fork-specific flags. In `settings.json`, `serverArgs`, `serverExtraArgs`, `cmakeArgs`, and `buildArgs` may be either shell-style strings or arrays of strings.
+
+The extension always starts llama.cpp with `--reasoning off` before extra args so local models run with thinking disabled by default.
 - `LLAMA_CPP_N_GPU_LAYERS`: default `999`.
 - `LLAMA_CPP_CTX`: default context size, default `131072`.
 - `LLAMA_CPP_MODEL_QUANT`: default GGUF filename match, default `Q4_K_M`.
@@ -84,9 +92,27 @@ explicitly. If `*File` is null, the extension lists the HF repo and picks the
 first `.gguf` containing the quant string, falling back to `Q4_K_M` or the first
 GGUF file.
 
+Example local fork configuration:
+
+```json
+{
+  "backend": "cuda",
+  "sourceDir": "~/src/llama.cpp-fork",
+  "buildDir": "build-pi",
+  "buildPolicy": "auto",
+  "cmakeArgs": "-DGGML_CUDA_FA_ALL_QUANTS=ON",
+  "serverExtraArgs": ["--flash-attn", "on"]
+}
+```
+
+If you already built the fork yourself, either set `serverBinary` to the exact
+`llama-server` path or set `buildDir` to the build directory and
+`buildPolicy` to `never`.
+
 ## Requirements
 
 - `curl`, `tar`, and `unzip`
+- `cmake` when building from `LLAMA_CPP_SOURCE_DIR`
 - enough disk and RAM/VRAM for your chosen GGUF quant
 - optional backend tools for detection: `nvidia-smi`, `rocminfo`/`rocm-smi`, or
   `vulkaninfo`

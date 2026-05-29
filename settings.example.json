@@ -1,6 +1,11 @@
 {
   "$schema": "https://raw.githubusercontent.com/your-name/pi-llama-cpp/main/settings.schema.json",
   "backend": "cuda",
+  "sourceDir": null,
+  "buildDir": null,
+  "buildPolicy": "auto",
+  "cmakeArgs": null,
+  "buildArgs": null,
   "modelQuant": "Q4_K_M",
   "ctx": 131072,
   "readyTimeoutMs": 900000,
@@ -12,5 +17,6 @@
   "qwen35_35b_a3bFile": null,
   "qwen35_122b_a10bRepo": "unsloth/Qwen3.5-122B-A10B-GGUF",
   "qwen35_122b_a10bFile": null,
-  "serverArgs": "--parallel 1"
+  "serverArgs": "--parallel 1",
+  "serverExtraArgs": ["--flash-attn", "on"]
 }
