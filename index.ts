@@ -4,7 +4,7 @@ import type { ChildProcess } from "node:child_process";
 import { closeSync, constants, openSync, readFileSync, writeSync } from "node:fs";
 import { access, appendFile, chmod, mkdir, open as openFile, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { arch, homedir, platform, totalmem } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
@@ -51,8 +51,10 @@ type Backend = "cpu" | "vulkan" | "cuda" | "rocm" | "metal";
 type ModelKey = (typeof MODEL_CATALOG)[number]["id"];
 type Settings = Record<string, unknown>;
 type StatusCallback = (message: string | undefined) => void;
-type RunOptions = { onStatus?: StatusCallback; progressPrefix?: string };
+type RunOptions = { onStatus?: StatusCallback; progressPrefix?: string; env?: NodeJS.ProcessEnv };
 type LocalBuildPolicy = "auto" | "always" | "never";
+type RuntimeKind = "llama-app" | "llama-server";
+type Runtime = { kind: RuntimeKind; binary: string; argsPrefix: string[]; cwd: string; env?: NodeJS.ProcessEnv };
 
 type ServerState = {
 	managedBy: string;
@@ -62,6 +64,7 @@ type ServerState = {
 	cwd: string;
 	binary: string;
 	args: string[];
+	runtimeKind?: RuntimeKind;
 	backend: Backend;
 	modelId: ModelKey;
 	modelPath: string;
@@ -177,7 +180,7 @@ async function execCapture(command: string, args: string[], timeoutMs = 2500): P
 async function processArgs(pid: number) { return (await execCapture("ps", ["-p", String(pid), "-o", "args="], 2000))?.trim(); }
 async function processStart(pid: number) { return (await execCapture("ps", ["-p", String(pid), "-o", "lstart="], 2000))?.trim() || undefined; }
 async function getOwnProcessStart() { ownProcessStart ??= (await processStart(process.pid)) ?? "unknown"; return ownProcessStart; }
-async function looksLikeServer(pid: number) { return !!(await processArgs(pid))?.match(/(^|[/\s])llama-server(\s|$)/); }
+async function looksLikeServer(pid: number) { return !!(await processArgs(pid))?.match(/(^|[/\s])llama-server(\s|$)|(^|[/\s])llama(\.exe)?\s+serve(\s|$)/); }
 
 function modelCatalogEntry(id: ModelKey) { return MODEL_CATALOG.find((m) => m.id === id)!; }
 function modelConfigString(prefix: string, legacyPrefix: string | undefined, suffix: string, def?: string): string | undefined {
@@ -210,7 +213,7 @@ async function runLogged(command: string, args: string[], cwd: string, label: st
 	const writeChunk = (c: Buffer | string) => { if (!closed) try { writeSync(logFd, c as any); } catch {} };
 	await new Promise<void>((resolve, reject) => {
 		let child: ChildProcess;
-		try { child = spawn(command, args, { cwd, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"], env: process.env }); } catch (e) { closed = true; closeSync(logFd); reject(e); return; }
+		try { child = spawn(command, args, { cwd, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...options.env } }); } catch (e) { closed = true; closeSync(logFd); reject(e); return; }
 		activeChild = child;
 		const out = (c: Buffer) => { writeChunk(c); progress?.onChunk(c); };
 		child.stdout?.on("data", out); child.stderr?.on("data", out);
@@ -242,31 +245,56 @@ async function chooseBackend(ctx?: { hasUI?: boolean; ui?: any }): Promise<Backe
 	selectedBackend ??= priority.find((b) => candidates.includes(b)) ?? "cpu";
 	return selectedBackend;
 }
-function assetScore(name: string, backend: Backend): number {
-	const n = name.toLowerCase(); if (!n.endsWith(".zip") && !n.endsWith(".tar.gz")) return -1;
-	if (platform() === "darwin" && !n.includes("macos")) return -1;
-	if (platform() === "linux" && !(n.includes("linux") || n.includes("ubuntu"))) return -1;
-	if (platform() === "win32" && !n.includes("win")) return -1;
-	if (arch() === "arm64" && !(n.includes("arm64") || n.includes("aarch64"))) return -1;
-	if (arch() === "x64" && !(n.includes("x64") || n.includes("x86_64"))) return -1;
-	const has = (s: string) => n.includes(s);
-	if (backend === "cuda" && !has("cuda")) return -1;
-	if (backend === "rocm" && !has("rocm")) return -1;
-	if (backend === "vulkan" && !has("vulkan")) return -1;
-	if (backend === "metal" && !has("metal") && !has("macos")) return -1;
-	if (backend === "cpu" && (has("cuda") || has("rocm") || has("vulkan") || has("openvino") || has("sycl") || has("hip") || has("opencl"))) return -1;
-	return (has("avx2") ? 2 : 0) + (has("x64") ? 1 : 0);
+function llamaAppBinaryName(): string { return process.platform === "win32" ? "llama.exe" : "llama"; }
+async function executablePath(path: string): Promise<string | undefined> {
+	try { await chmod(path, 0o755).catch(() => {}); await access(path, constants.X_OK); return path; } catch { return undefined; }
 }
-async function latestReleaseAsset(backend: Backend): Promise<{ name: string; url: string }> {
-	const forced = configString("LLAMA_CPP_RELEASE_URL");
-	if (forced) return { name: basename(new URL(forced).pathname), url: forced };
-	const res = await fetch("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest", { headers: { "user-agent": "pi-llama-cpp" } });
-	if (!res.ok) throw new Error(`GitHub release lookup failed: HTTP ${res.status}`);
-	const release: any = await res.json();
-	let best: any, bestScore = -1;
-	for (const asset of release.assets ?? []) { const score = assetScore(String(asset.name), backend); if (score > bestScore) { best = asset; bestScore = score; } }
-	if (!best) throw new Error(`No llama.cpp binary release asset found for backend ${backend}; set LLAMA_CPP_RELEASE_URL`);
-	return { name: best.name, url: best.browser_download_url };
+async function findExecutableOnPath(name: string): Promise<string | undefined> {
+	for (const dir of (process.env.PATH ?? "").split(delimiter).filter(Boolean)) {
+		const found = await executablePath(join(dir, name));
+		if (found) return found;
+	}
+	return undefined;
+}
+async function isLlamaApp(binary: string): Promise<boolean> {
+	const help = await execCapture(binary, ["help"], 2500);
+	return /Available commands:[\s\S]*\bserve\b/.test(help ?? "");
+}
+function llamaAppInstallEnv(backend: Backend, home: string): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = { HOME: home };
+	if (backend === "cpu") { env.SKIP_CUDA = "1"; env.SKIP_ROCM = "1"; env.SKIP_VULKAN = "1"; }
+	else if (backend === "vulkan") { env.SKIP_CUDA = "1"; env.SKIP_ROCM = "1"; }
+	else if (backend === "rocm") { env.SKIP_CUDA = "1"; env.SKIP_VULKAN = "1"; }
+	else if (backend === "cuda") { env.SKIP_ROCM = "1"; env.SKIP_VULKAN = "1"; }
+	return env;
+}
+async function ensureLlamaAppRuntime(backend: Backend, onStatus?: StatusCallback): Promise<Runtime> {
+	const binaryName = llamaAppBinaryName();
+	const forced = configString("LLAMA_CPP_LLAMA_APP_BINARY");
+	if (forced) { const binary = resolveConfigPath(forced); await access(binary, constants.X_OK); return { kind: "llama-app", binary, argsPrefix: ["serve"], cwd: dirname(binary) }; }
+	if (platform() === "win32") throw new Error("llama.app install.sh does not support Windows yet; set LLAMA_CPP_SERVER_BINARY to an existing llama-server.exe");
+	const configuredHome = configString("LLAMA_CPP_LLAMA_APP_HOME");
+	const configuredInstallUrl = configString("LLAMA_CPP_LLAMA_APP_INSTALL_URL");
+	if (!configuredHome && !configuredInstallUrl) for (const path of [join(homedir(), ".llama-app", binaryName), join(homedir(), ".local", "bin", binaryName), await findExecutableOnPath(binaryName)]) {
+		if (!path) continue;
+		const binary = await executablePath(path);
+		if (binary && await isLlamaApp(binary)) return { kind: "llama-app", binary, argsPrefix: ["serve"], cwd: dirname(binary) };
+	}
+	const appHome = resolveConfigPath(configuredHome ?? join(RUNTIME_DIR, "llama-app", backend));
+	const binary = join(appHome, ".llama-app", binaryName);
+	const existing = await executablePath(binary);
+	const env = llamaAppInstallEnv(backend, appHome);
+	if (existing) return { kind: "llama-app", binary: existing, argsPrefix: ["serve"], cwd: dirname(existing), env };
+	const installUrl = configuredInstallUrl ?? "https://llama.app/install.sh";
+	await rm(appHome, { recursive: true, force: true }); await mkdir(appHome, { recursive: true }); await mkdir(ROOT_DIR, { recursive: true });
+	const script = join(ROOT_DIR, "llama-app-install.sh");
+	onStatus?.(`installing llama.app runtime (${backend})`);
+	await runLogged("curl", ["-L", "--fail", "--show-error", "-o", script, installUrl], ROOT_DIR, "download llama.app installer", { onStatus, progressPrefix: "downloading llama.app installer" });
+	await runLogged("sh", [script], ROOT_DIR, "install llama.app runtime", { onStatus, progressPrefix: "installing llama.app", env });
+	const installed = await executablePath(binary);
+	if (!installed) throw new Error(`Installed llama.app but did not find executable ${binary}`);
+	await writeJsonAtomic(join(appHome, "pi-llama-cpp-runtime.json"), { backend, installUrl, binary: installed, kind: "llama-app" });
+	return { kind: "llama-app", binary: installed, argsPrefix: ["serve"], cwd: dirname(installed), env };
 }
 function localBuildPolicy(): LocalBuildPolicy {
 	const value = (configString("LLAMA_CPP_BUILD_POLICY", "auto") ?? "auto").toLowerCase();
@@ -306,25 +334,14 @@ async function ensureLocalRuntime(backend: Backend, onStatus?: StatusCallback): 
 	if (!built) throw new Error(`Built ${sourceDir} but did not find executable ${binaryName} under ${buildDir}`);
 	return built;
 }
-async function ensureRuntime(backend: Backend, onStatus?: StatusCallback): Promise<string> {
-	const forced = configString("LLAMA_CPP_SERVER_BINARY"); if (forced) { const binary = resolveConfigPath(forced); await access(binary, constants.X_OK); return binary; }
-	const local = await ensureLocalRuntime(backend, onStatus); if (local) return local;
-	const dir = join(RUNTIME_DIR, backend); const binary = join(dir, process.platform === "win32" ? "llama-server.exe" : "llama-server");
-	const manifest = await readJson<{ binary?: string }>(join(dir, "pi-llama-cpp-runtime.json"));
-	if (manifest?.binary) { try { await access(manifest.binary, constants.X_OK); return manifest.binary; } catch {} }
-	try { await access(binary, constants.X_OK); return binary; } catch {}
-	await rm(dir, { recursive: true, force: true }); await mkdir(dir, { recursive: true });
-	const asset = await latestReleaseAsset(backend); const zip = join(ROOT_DIR, asset.name);
-	onStatus?.(`downloading llama.cpp ${backend} runtime`);
-	await runLogged("curl", ["-L", "--fail", "--progress-bar", "-o", zip, asset.url], ROOT_DIR, `download ${asset.name}`, { onStatus, progressPrefix: "downloading llama.cpp" });
-	onStatus?.("unpacking llama.cpp runtime");
-	if (asset.name.toLowerCase().endsWith(".tar.gz")) await runLogged("tar", ["-xzf", zip, "-C", dir], ROOT_DIR, "unpack llama.cpp runtime", { onStatus, progressPrefix: "unpacking llama.cpp" });
-	else await runLogged("unzip", ["-q", "-o", zip, "-d", dir], ROOT_DIR, "unpack llama.cpp runtime", { onStatus, progressPrefix: "unpacking llama.cpp" });
-	const found = await findFile(dir, process.platform === "win32" ? "llama-server.exe" : "llama-server");
-	if (!found) throw new Error(`Unpacked ${asset.name} but did not find llama-server`);
-	await chmod(found, 0o755).catch(() => {}); await access(found, constants.X_OK);
-	await writeJsonAtomic(join(dir, "pi-llama-cpp-runtime.json"), { backend, asset: asset.name, binary: found });
-	return found;
+async function ensureRuntime(backend: Backend, onStatus?: StatusCallback): Promise<Runtime> {
+	const releaseUrl = configString("LLAMA_CPP_RELEASE_URL");
+	if (releaseUrl) throw new Error("LLAMA_CPP_RELEASE_URL is no longer supported; pi-llama-cpp now installs llama.app from https://llama.app/. Use LLAMA_CPP_LLAMA_APP_BINARY or LLAMA_CPP_SERVER_BINARY to override the runtime.");
+	const forced = configString("LLAMA_CPP_SERVER_BINARY");
+	if (forced) { const binary = resolveConfigPath(forced); await access(binary, constants.X_OK); return { kind: "llama-server", binary, argsPrefix: [], cwd: dirname(binary) }; }
+	const local = await ensureLocalRuntime(backend, onStatus);
+	if (local) return { kind: "llama-server", binary: local, argsPrefix: [], cwd: dirname(local) };
+	return ensureLlamaAppRuntime(backend, onStatus);
 }
 async function findFile(dir: string, name: string): Promise<string | undefined> { for (const e of await readdir(dir, { withFileTypes: true }).catch(() => [])) { const p = join(dir, e.name); if (e.isFile() && e.name === name) return p; if (e.isDirectory()) { const r = await findFile(p, name); if (r) return r; } } }
 async function chooseHfFile(spec: ModelSpec): Promise<string> {
@@ -365,15 +382,15 @@ function serverArgs(spec: ModelSpec, modelPath: string): string[] {
 	const extra = [...configArgs("LLAMA_CPP_SERVER_ARGS", "--parallel 1 --timeout 600"), ...configArgs("LLAMA_CPP_SERVER_EXTRA_ARGS")];
 	return ["--host", "127.0.0.1", "--port", "8080", "--model", modelPath, "--ctx-size", String(spec.contextWindow), "--n-gpu-layers", configString("LLAMA_CPP_N_GPU_LAYERS", "999")!, "--jinja", "--reasoning", "off", ...extra];
 }
-async function startServerLocked(binary: string, backend: Backend, spec: ModelSpec, modelPath: string) { const args = serverArgs(spec, modelPath); await appendLog(`\n[${new Date().toISOString()}] start llama-server (${backend}, ${spec.id}, ${formatBytes(totalmem())} RAM)\n$ ${[binary, ...args].map(shellQuote).join(" ")}\n`); const logFd = openSync(LOG_FILE, "a"); let pid: number | undefined; try { const child = spawn(binary, args, { cwd: dirname(binary), detached: true, stdio: ["ignore", logFd, logFd], env: process.env }); child.unref(); pid = child.pid; } finally { closeSync(logFd); } if (!pid) throw new Error("failed to start llama-server"); const now = Date.now(); await writeJsonAtomic(STATE_FILE, { managedBy: MANAGED_BY, pid, baseUrl: API_BASE_URL, port: 8080, cwd: dirname(binary), binary, args, backend, modelId: spec.id, modelPath, startedAt: now, startedAtIso: new Date(now).toISOString() } satisfies ServerState); }
+async function startServerLocked(runtime: Runtime, backend: Backend, spec: ModelSpec, modelPath: string) { const args = [...runtime.argsPrefix, ...serverArgs(spec, modelPath)]; await appendLog(`\n[${new Date().toISOString()}] start ${runtime.kind} (${backend}, ${spec.id}, ${formatBytes(totalmem())} RAM)\n$ ${[runtime.binary, ...args].map(shellQuote).join(" ")}\n`); const logFd = openSync(LOG_FILE, "a"); let pid: number | undefined; try { const child = spawn(runtime.binary, args, { cwd: runtime.cwd, detached: true, stdio: ["ignore", logFd, logFd], env: { ...process.env, ...runtime.env } }); child.unref(); pid = child.pid; } finally { closeSync(logFd); } if (!pid) throw new Error(`failed to start ${runtime.kind}`); const now = Date.now(); await writeJsonAtomic(STATE_FILE, { managedBy: MANAGED_BY, pid, baseUrl: API_BASE_URL, port: 8080, cwd: runtime.cwd, binary: runtime.binary, args, runtimeKind: runtime.kind, backend, modelId: spec.id, modelPath, startedAt: now, startedAtIso: new Date(now).toISOString() } satisfies ServerState); }
 async function waitForServerReady(modelId: ModelKey, onStatus?: StatusCallback) { const started = Date.now(); let last = 0; while (Date.now() - started < READY_TIMEOUT_MS) { if (runtimeDisposed || shuttingDown) return; if (await checkReadyForModel(modelId)) return; const state = await readState(); if (state?.pid && !isPidAlive(state.pid)) throw new Error(`llama-server exited before becoming ready; see ${LOG_FILE}`); if (Date.now() - last > 10000) { onStatus?.(`llama-server starting (${Math.round((Date.now() - started) / 1000)}s)`); last = Date.now(); } await sleep(1000); } throw new Error(`Timed out waiting for llama-server at ${API_BASE_URL}; see ${LOG_FILE}`); }
-async function ensureServerInner(modelId: ModelKey, ctx: any, onStatus?: StatusCallback) { const spec = modelSpec(modelId); let stoppingPid: number | undefined; await withLock(async () => { await activateLease(); const state = await readState(); if (state?.pid && isPidAlive(state.pid) && await looksLikeServer(state.pid)) { if (state.stopping) { stoppingPid = state.pid; return; } if (state.modelId === modelId) return; onStatus?.(`switching llama-server to ${modelId}`); await stopServerPidLocked(state.pid, `switch to ${modelId}`); } else if (state?.pid) await clearState(); const backend = await chooseBackend(ctx); const binary = await ensureRuntime(backend, onStatus); const modelPath = await ensureModel(spec, onStatus); onStatus?.(`starting llama-server (${backend}, ${modelId})`); await startServerLocked(binary, backend, spec, modelPath); }, STARTUP_LOCK_TIMEOUT_MS); if (stoppingPid) { await waitForPidExit(stoppingPid, SHUTDOWN_GRACE_MS); return ensureServerInner(modelId, ctx, onStatus); } await waitForServerReady(modelId, onStatus); }
+async function ensureServerInner(modelId: ModelKey, ctx: any, onStatus?: StatusCallback) { const spec = modelSpec(modelId); let stoppingPid: number | undefined; await withLock(async () => { await activateLease(); const state = await readState(); if (state?.pid && isPidAlive(state.pid) && await looksLikeServer(state.pid)) { if (state.stopping) { stoppingPid = state.pid; return; } if (state.modelId === modelId) return; onStatus?.(`switching llama-server to ${modelId}`); await stopServerPidLocked(state.pid, `switch to ${modelId}`); } else if (state?.pid) await clearState(); const backend = await chooseBackend(ctx); const runtime = await ensureRuntime(backend, onStatus); const modelPath = await ensureModel(spec, onStatus); onStatus?.(`starting ${runtime.kind} (${backend}, ${modelId})`); await startServerLocked(runtime, backend, spec, modelPath); }, STARTUP_LOCK_TIMEOUT_MS); if (stoppingPid) { await waitForPidExit(stoppingPid, SHUTDOWN_GRACE_MS); return ensureServerInner(modelId, ctx, onStatus); } await waitForServerReady(modelId, onStatus); }
 function ensureServer(modelId: ModelKey, ctx: any, onStatus?: StatusCallback): Promise<void> { if (startupPromise) { if (startupModelId === modelId) return startupPromise; return startupPromise.catch(() => {}).then(() => ensureServer(modelId, ctx, onStatus)); } startupModelId = modelId; const p = ensureServerInner(modelId, ctx, onStatus).finally(() => { if (startupPromise === p) { startupPromise = undefined; startupModelId = undefined; } }); startupPromise = p; return p; }
 
 function registerProvider(pi: ExtensionAPI) {
 	pi.registerProvider(PROVIDER_ID, { name: "llama.cpp local", baseUrl: API_BASE_URL, api: PROVIDER_API, apiKey: configString("LLAMA_CPP_API_KEY", "llama-cpp-local"), compat: { supportsStore: false, supportsDeveloperRole: false, supportsReasoningEffort: false, supportsUsageInStreaming: true, maxTokensField: "max_tokens", supportsStrictMode: false }, models: allModels().map((m) => ({ id: m.id, name: m.name, reasoning: false, input: ["text"], contextWindow: m.contextWindow, maxTokens: m.maxTokens, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } })) } as any);
 }
-function registerCommand(pi: ExtensionAPI) { pi.registerCommand("llama-cpp", { description: "Show llama.cpp runtime status and log path", handler: async (_args, ctx) => { const state = await readState(); ctx.ui.notify(state?.pid && isPidAlive(state.pid) ? `llama-server pid=${state.pid}, model=${state.modelId}, backend=${state.backend}; log: ${LOG_FILE}` : `llama-server is not running; log: ${LOG_FILE}`, "info"); } }); }
+function registerCommand(pi: ExtensionAPI) { pi.registerCommand("llama-cpp", { description: "Show llama.cpp runtime status and log path", handler: async (_args, ctx) => { const state = await readState(); ctx.ui.notify(state?.pid && isPidAlive(state.pid) ? `${state.runtimeKind ?? "llama-server"} pid=${state.pid}, model=${state.modelId}, backend=${state.backend}; log: ${LOG_FILE}` : `llama server is not running; log: ${LOG_FILE}`, "info"); } }); }
 
 export default function (pi: ExtensionAPI) {
 	runtimeDisposed = false; shuttingDown = false; leaseStartedAt = Date.now(); watchdogStarted = false; startupPromise = undefined; startupModelId = undefined; activeChild = undefined;

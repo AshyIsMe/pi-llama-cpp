@@ -1,10 +1,10 @@
 {
   "name": "pi-llama-cpp",
   "version": "0.1.0",
-  "description": "Pi provider extension for local Qwen 3.6 / Qwen 3.6 MTP / Qwen 3.5 GGUF models via llama.cpp.",
+  "description": "Pi provider extension for local Qwen 3.6 / Qwen 3.6 MTP / Qwen 3.5 GGUF models via llama.app/llama.cpp.",
   "type": "module",
   "license": "MIT",
-  "keywords": ["pi-package", "pi-extension", "llama.cpp", "qwen", "gguf", "unsloth"],
+  "keywords": ["pi-package", "pi-extension", "llama.app", "llama.cpp", "qwen", "gguf", "unsloth"],
   "pi": { "extensions": ["./index.ts"] },
   "files": [
     "index.ts",

@@ -1,6 +1,9 @@
 {
   "$schema": "https://raw.githubusercontent.com/your-name/pi-llama-cpp/main/settings.schema.json",
   "backend": "cuda",
+  "llamaAppBinary": null,
+  "llamaAppHome": null,
+  "llamaAppInstallUrl": "https://llama.app/install.sh",
   "sourceDir": null,
   "buildDir": null,
   "buildPolicy": "auto",
